@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\code\headers\Endpoint.hpp" />
+    <ClInclude Include="..\..\code\headers\Address.hpp" />
+    <ClInclude Include="..\..\code\headers\HttpMessage.hpp" />
+    <ClInclude Include="..\..\code\headers\HttpRequest.hpp" />
+    <ClInclude Include="..\..\code\headers\HttpResponse.hpp" />
+    <ClInclude Include="..\..\code\headers\HttpServer.hpp" />
+    <ClInclude Include="..\..\code\headers\macros.hpp" />
+    <ClInclude Include="..\..\code\headers\MimeType.hpp" />
+    <ClInclude Include="..\..\code\headers\NetworkSetup.hpp" />
+    <ClInclude Include="..\..\code\headers\Port.hpp" />
+    <ClInclude Include="..\..\code\headers\HttpRequestHandler.hpp" />
+    <ClInclude Include="..\..\code\headers\snippets.hpp" />
+    <ClInclude Include="..\..\code\headers\Socket.hpp" />
+    <ClInclude Include="..\..\code\headers\NetworkException.hpp" />
+    <ClInclude Include="..\..\code\headers\TcpListener.hpp" />
+    <ClInclude Include="..\..\code\headers\TcpSocket.hpp" />
+    <ClInclude Include="..\..\code\headers\UdpSocket.hpp" />
+    <ClInclude Include="..\..\code\sources\winsock2\winsock2.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\code\sources\HttpRequest.cpp" />
+    <ClCompile Include="..\..\code\sources\HttpResponse.cpp" />
+    <ClCompile Include="..\..\code\sources\HttpServer.cpp" />
+    <ClCompile Include="..\..\code\sources\MimeType.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\Address.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\NetworkSetup.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\Socket.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\SocketException.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\TcpListener.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\TcpSocket.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\UdpSocket.cpp" />
+    <ClCompile Include="..\..\code\sources\winsock2\winsock2.cpp" />
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{f5dc2423-cd25-4fa6-ba1d-85294a2d398a}</ProjectGuid>
+    <RootNamespace>networklibrary</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>..\..\code\headers</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>..\..\code\headers</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
