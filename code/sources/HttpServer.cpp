@@ -32,41 +32,18 @@ namespace argb
     {
     }
 
-    void HttpServer::RequestHandlerManager::register_handler_factory (std::string path, HttpRequestHandlerFactory & factory) 
+    HttpRequestHandler::Ptr HttpServer::RequestHandlerManager::create_handler
+    (
+        HttpRequest::Method method,
+        std::string_view    request_path
+    )
+    const
     {
-        // Ensure that the path does not end with a '/' to maintain consistency in validation logic:
-
-        if (path.length () > 1 && path.back () == '/') 
+        for (auto * factory : handler_factories)
         {
-            path.pop_back ();
-        }
-
-        handler_factories[std::move (path)] = &factory;
-    }
-
-    HttpRequestHandlerFactory * HttpServer::RequestHandlerManager::find_handler_factory_for_path(std::string_view request_path) const 
-    {
-        if (not handler_factories.empty ())
-        {
-            auto item = handler_factories.upper_bound (request_path);
-
-            if (item != handler_factories.begin ()) 
+            if (auto handler = factory->create_handler (method, request_path))
             {
-                --item;
-
-                const std::string & factory_path = item->first;
-
-                if (request_path.starts_with (factory_path))
-                {                
-                    // If the request path is exactly the same as the factory path, or if the next character in the
-                    // request path after the factory path is a '/' (indicating a complete folder match), or if the
-                    // factory path is the root "/", then we consider it a valid match:
-
-                    if (request_path.length () == factory_path.length () || request_path[factory_path.length ()] == '/' || factory_path == "/")
-                    {
-                        return item->second;
-                    }
-                }
+                return handler;
             }
         }
 
@@ -232,7 +209,7 @@ namespace argb
             {
                 if (context.handler)
                 {
-                    const bool finished = context.handler->process (context.request, context.response, socket_handle);
+                    const bool finished = context.handler->process (context.request, context.response);
 
                     if (finished)
                     {

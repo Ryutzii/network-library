@@ -22,9 +22,9 @@ namespace argb
 
         /** Represents the HTTP methods supported by the HttpRequest class.
           */ 
-        enum Method
+        enum class Method
         {
-            UNDEFINED,              ///< Represents an undefined or unrecognized HTTP method
+            UNDEFINED = -1,         ///< Represents an undefined or unrecognized HTTP method
             OPTIONS,
             HEAD,
             GET,
@@ -34,6 +34,7 @@ namespace argb
             UNLINK,
             DELETE,
             TRACE,
+            COUNT,                  ///< Total number of defined HTTP methods (used for array sizing and iteration)
         };
 
     public:
@@ -68,10 +69,19 @@ namespace argb
             void parse_query         (std::string_view query_string);
             void parse_header_fields (std::string_view fields);
             void translate_method    (std::string_view method_string);
+
+        public:
+
+            static HttpRequest::Method method_from_string (std::string_view method_string);
+
         };
 
         class Serializer
         {
+        public:
+
+            static std::string_view method_to_string (HttpRequest::Method method);
+
         };
 
     private:
@@ -86,7 +96,7 @@ namespace argb
 
         HttpRequest()
         {
-            method = UNDEFINED;
+            method = Method::UNDEFINED;
         }
 
     public:
@@ -137,7 +147,7 @@ namespace argb
           * @return A string view representing the value of the query parameter associated with the specified key, or an empty
           *     string view if the key is not found in the query parameters.
           */
-        std::string_view get_query_parameter (std::string_view key) const
+        std::string_view get_query (std::string_view key) const
         {
             auto   item  = query.find (key);
             return item != query. end () ? item->second : std::string_view{};

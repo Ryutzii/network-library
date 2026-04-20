@@ -213,24 +213,46 @@ namespace argb
 
     void HttpRequest::Parser::translate_method (std::string_view method_string)
     {
-        static const std::map<std::string_view, HttpRequest::Method> method_values
+        request->method = method_from_string (method_string);
+    }
+
+    HttpRequest::Method HttpRequest::Parser::method_from_string (std::string_view method_string)
+    {
+        if (method_string.length () >= 3)
         {
-            { "OPTIONS" , Method::OPTIONS },
-            { "HEAD"    , Method::HEAD    },
-            { "GET"     , Method::GET     },
-            { "POST"    , Method::POST    },
-            { "PUT"     , Method::PUT     },
-            { "LINK"    , Method::LINK    },
-            { "UNLINK"  , Method::UNLINK  },
-            { "DELETE"  , Method::DELETE  },
-            { "TRACE"   , Method::TRACE   },
-        };
+            switch (method_string[0])
+            {
+                case 'G': if (method_string == "GET"    ) return Method::GET;     break;
+                case 'P': if (method_string == "POST"   ) return Method::POST;
+                          if (method_string == "PUT"    ) return Method::PUT;     break;
+                case 'D': if (method_string == "DELETE" ) return Method::DELETE;  break;
+                case 'O': if (method_string == "OPTIONS") return Method::OPTIONS; break;
+                case 'H': if (method_string == "HEAD"   ) return Method::HEAD;    break;
+                case 'T': if (method_string == "TRACE"  ) return Method::TRACE;   break;
+                case 'L': if (method_string == "LINK"   ) return Method::LINK;    break;
+                case 'U': if (method_string == "UNLINK" ) return Method::UNLINK;  break;
+            }
+        }
 
-        auto item  = method_values.find (method_string);
+        return Method::UNDEFINED;
+    }
 
-        request->method = item != method_values.end ()
-            ? item->second
-            : Method::UNDEFINED;
+    std::string_view HttpRequest::Serializer::method_to_string (HttpRequest::Method method)
+    {
+        switch (method)
+        {
+            case Method::OPTIONS: return "OPTIONS";
+            case Method::HEAD:    return "HEAD";
+            case Method::GET:     return "GET";
+            case Method::POST:    return "POST";
+            case Method::PUT:     return "PUT";
+            case Method::LINK:    return "LINK";
+            case Method::UNLINK:  return "UNLINK";
+            case Method::DELETE:  return "DELETE";
+            case Method::TRACE:   return "TRACE";
+        }
+
+        return {};
     }
 
 }

@@ -97,6 +97,17 @@ namespace argb
             }
         };
 
+        void send_plain_text_response (HttpResponse & response, int status, std::string_view message)
+        {
+            HttpResponse::Serializer(response)
+                .status     (status)
+                .header     ("Content-Type",   "text/plain; charset=utf-8")
+                .header     ("Content-Length",  std::to_string (message.size ()))
+                .header     ("Connection",     "close")
+                .end_header ()
+                .body       (message);
+        }
+
     public:
 
         /** Handles an incoming HTTP request and produces an appropriate response. This method must be implemented by
@@ -106,12 +117,11 @@ namespace argb
           * 
           * @param request  The incoming HTTP request.
           * @param response The HTTP response to be populated.
-          * @param id       The unique identifier for the HTTP message.
           * 
           * @return True if the handler finished processing the request and the response is ready to be sent;
           *     false if the handler is still processing.
           */
-        virtual bool process (const HttpRequest & request, HttpResponse & response, HttpMessage::Id id) = 0;
+        virtual bool process (const HttpRequest & request, HttpResponse & response) = 0;
 
     };
 

@@ -59,7 +59,7 @@ namespace argb
         return ostream
             << exception.what ()
             << " (error code: " << exception.get_native_error_code ()
-            << ", location: "   << exception.get_throw_location ().file_name () << ":" << exception.get_throw_location ().line () << ")";
+            << ", at: " << exception.get_throw_location ().file_name () << ":" << exception.get_throw_location ().line () << ")";
     }
 
 }

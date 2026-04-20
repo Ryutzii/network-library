@@ -55,31 +55,18 @@ namespace argb
 
         class RequestHandlerManager
         {
-            // The third parameter std::less<> enables heterogeneous lookup, which avoids the need to construct a
-            // temporary std::string for each lookup, allowing the use of std::string_view directly:
-
-            using HandlerFactoryMap = std::map<std::string, HttpRequestHandlerFactory *, std::less<>>;
+            using HandlerFactoryContainer = std::vector<HttpRequestHandlerFactory *>;
             
-            HandlerFactoryMap handler_factories;
+            HandlerFactoryContainer handler_factories;
 
         public:
 
-            void register_handler_factory (std::string path, HttpRequestHandlerFactory & factory);
-
-            HttpRequestHandler::Ptr create_handler (HttpRequest::Method method, std::string_view request_path) const
+            void register_handler_factory (HttpRequestHandlerFactory & factory)
             {
-                if (auto * factory = find_handler_factory_for_path (request_path))
-                {
-                    return factory->create_handler (method, request_path);
-                }
-
-                return nullptr;
+                handler_factories.push_back (&factory);
             }
 
-        private:
-
-            HttpRequestHandlerFactory * find_handler_factory_for_path (std::string_view request_path) const;
-
+            HttpRequestHandler::Ptr create_handler (HttpRequest::Method method, std::string_view request_path) const;
         };
 
         struct ListenerScopeGuard
@@ -108,9 +95,9 @@ namespace argb
         {
         }
 
-        void register_handler_factory (std::string_view path, HttpRequestHandlerFactory & factory)
+        void register_handler_factory (HttpRequestHandlerFactory & factory)
         {
-            request_handler_manager.register_handler_factory (std::string(path), factory);
+            request_handler_manager.register_handler_factory (factory);
         }
 
         void run (const Port& local_port)
