@@ -19,11 +19,83 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
+#include <future>
+#include <vector>
+#include <algorithm>
 
 namespace argb
 {
+
+    // Pequeño ThreadPool utilitario
+    class ThreadPool
+    {
+        std::vector<std::thread> workers;
+        std::queue<std::function<void()>> tasks;
+        std::mutex tasks_mutex;
+        std::condition_variable tasks_cv;
+        std::atomic<bool> stop_flag{ false };
+
+    public:
+        explicit ThreadPool(size_t thread_count = 0)
+        {
+            if (thread_count == 0)
+                thread_count = std::max<size_t>(1, std::thread::hardware_concurrency());
+
+            for (size_t i = 0; i < thread_count; ++i)
+            {
+                workers.emplace_back([this] {
+                    for (;;)
+                    {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lk(this->tasks_mutex);
+                            this->tasks_cv.wait(lk, [this] { return this->stop_flag.load() || !this->tasks.empty(); });
+                            if (this->stop_flag.load() && this->tasks.empty())
+                                return;
+                            task = std::move(this->tasks.front());
+                            this->tasks.pop();
+                        }
+                        try { task(); }
+                        catch (...) { /* swallow to keep pool alive */ }
+                    }
+                    });
+            }
+        }
+
+        ThreadPool(const ThreadPool&) = delete;
+        ThreadPool& operator=(const ThreadPool&) = delete;
+
+        ~ThreadPool()
+        {
+            stop_flag.store(true);
+            tasks_cv.notify_all();
+            for (auto& t : workers)
+            {
+                if (t.joinable()) t.join();
+            }
+        }
+
+        template<typename F, typename... Args>
+        auto submit(F&& f, Args&&... args)
+        {
+            using result_t = std::invoke_result_t<F, Args...>;
+            auto task_ptr = std::make_shared<std::packaged_task<result_t()>>(
+                std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+            );
+
+            std::future<result_t> res = task_ptr->get_future();
+            {
+                std::lock_guard<std::mutex> lk(tasks_mutex);
+                tasks.emplace([task_ptr]() { (*task_ptr)(); });
+            }
+            tasks_cv.notify_one();
+            return res;
+        }
+    };
 
     class HttpServer
     {
@@ -47,6 +119,10 @@ namespace argb
             HttpRequest::Parser      request_parser;
             size_t                   response_bytes_sent;
             HttpRequestHandler::Ptr  handler;
+
+            // Mutex por conexión para proteger request/response/handler/state.
+            // Orden de bloqueo: primero siempre tomar 'connections_mutex' y luego 'mutex' de la conexión.
+            std::mutex               mutex;
 
             ConnectionContext();
 
@@ -98,19 +174,57 @@ namespace argb
         std::mutex            accepted_queue_mutex;
         std::condition_variable accepted_cv; // notifica al worker de nuevas conexiones
 
+        // Cola para notificar al hilo de handlers sobre conexiones listas para procesar
+        std::queue<TcpSocket::Handle> handler_queue;
+        std::mutex                    handler_queue_mutex;
+        std::condition_variable       handler_cv;
+
         // Mutex para proteger acceso a 'connections' si fuera necesario (stop/join)
         std::mutex            connections_mutex;
 
         // Hilo que acepta conexiones y cierra inactivas
         std::thread           accept_thread;
 
-        // Segundo hilo: realiza lectura/escritura y ejecuta handlers
+        // Worker que realiza lectura/escritura no bloqueante
         std::thread           worker_thread;
+
+        // Hilo que coordina creación/registro de handlers (ya no ejecuta process directamente)
+        std::thread           handler_thread;
+
+        // Hilo dedicado a ejecutar handlers que requieren Lua (único hilo con la instancia de lua::State)
+        std::thread           lua_thread;
+
+        // Cola y sincronización para tareas que ejecuta el hilo Lua (almacena handles)
+        std::deque<TcpSocket::Handle> lua_task_queue;
+        std::mutex                   lua_task_queue_mutex;
+        std::condition_variable      lua_task_queue_cv;
+
+        // Tabla de corrutinas para cada handle (la corrutina es una función que al ejecutarla devuelve true si ha terminado)
+        std::map<TcpSocket::Handle, std::function<bool(HttpRequest&, HttpResponse&)>> lua_coroutines;
+        std::mutex lua_coroutines_mutex;
+
+        // ThreadPool para handlers C++ (UN SOLO pool)
+        ThreadPool thread_pool;
 
     public:
 
         HttpServer()
+            : thread_pool(std::max<size_t>(1, std::thread::hardware_concurrency()))
         {
+        }
+
+        ~HttpServer() noexcept
+        {
+            // Garantizar parada segura al destruir el objeto.
+            // Se captura cualquier excepción para evitar throw desde el destructor.
+            try
+            {
+                stop();
+            }
+            catch (...)
+            {
+                // swallow: no se permite lanzar desde destructor
+            }
         }
 
         void register_handler_factory(HttpRequestHandlerFactory& factory)
@@ -128,6 +242,25 @@ namespace argb
         void stop()
         {
             running = false;
+            // despertar hilos bloqueados en waits
+            accepted_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lg(handler_queue_mutex);
+            }
+            handler_cv.notify_all();
+
+            // Notificar al hilo Lua
+            {
+                std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
+            }
+            lua_task_queue_cv.notify_all();
+
+            // join threads if running
+            if (accept_thread.joinable()) accept_thread.join();
+            if (worker_thread.joinable()) worker_thread.join();
+            if (handler_thread.joinable()) handler_thread.join();
+            if (lua_thread.joinable()) lua_thread.join();
+            // thread_pool destructor se encarga de detener sus hilos
         }
 
     private:
@@ -142,6 +275,12 @@ namespace argb
 
         // Función ejecutada por el hilo de aceptación
         void accept_thread_run();
+
+        // Nueva rutina ejecutada por el hilo de handlers
+        void handler_thread_run();
+
+        // Rutina para el hilo único de Lua (ejecuta todos los handlers que requieren Lua)
+        void lua_thread_run();
 
     };
 

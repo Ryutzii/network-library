@@ -1,4 +1,3 @@
-
 /// @copyright Copyright (c) 2026 Ángel, All rights reserved.
 /// angel.rodriguez@udit.es
 
@@ -7,6 +6,7 @@
 #include <HttpRequest.hpp>
 #include <HttpResponse.hpp>
 #include <memory>
+#include <functional>
 
 namespace argb
 {
@@ -122,6 +122,26 @@ namespace argb
           *     false if the handler is still processing.
           */
         virtual bool process (const HttpRequest & request, HttpResponse & response) = 0;
+
+        /** Indica si este handler necesita ejecutarse en el hilo único de Lua.
+          * Por defecto devuelve false; los handlers que integren Lua deben sobreescribirlo para devolver true.
+          */
+        virtual bool requires_lua() const { return false; }
+
+        /** Crear una "corrutina" ejecutable en el hilo Lua.
+          * Debe devolverse una std::function<bool()> que:
+          *  - al invocarse reanuda la corrutina y devuelve true si ha terminado;
+          *  - devuelve false si la corrutina se ha yield/pausado y debe reprogramarse.
+          *
+          * Esta función se llamará siempre desde el hilo Lua, por tanto la creación de la corrutina
+          * puede envolver llamadas a la única instancia de lua::State que exista.
+          *
+          * Por defecto devuelve una función vacía (no hay corrutina).
+          */
+        virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine()
+        {
+            return {};
+        }
 
     };
 

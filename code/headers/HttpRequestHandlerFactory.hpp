@@ -10,12 +10,12 @@
 namespace argb
 {
 
-    class HttpRequestHandlerFactory
-    {
-    public:
+	class HttpRequestHandlerFactory
+	{
+	public:
 
-        virtual HttpRequestHandler::Ptr create_handler (HttpRequest::Method method, std::string_view request_path) = 0;
+		virtual HttpRequestHandler::Ptr create_handler(HttpRequest::Method method, std::string_view request_path) = 0;
 
-    };
+	};
 
 }
