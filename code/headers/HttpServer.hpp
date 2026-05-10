@@ -26,16 +26,18 @@
 #include <future>
 #include <vector>
 #include <algorithm>
+#include <tuple>
+
 
 namespace argb
 {
 
-    // Pequeño ThreadPool utilitario
     class ThreadPool
     {
         std::vector<std::thread> workers;
         std::queue<std::function<void()>> tasks;
         std::mutex tasks_mutex;
+        std::mutex exclusive_tasks_mutex;
         std::condition_variable tasks_cv;
         std::atomic<bool> stop_flag{ false };
 
@@ -60,7 +62,7 @@ namespace argb
                             this->tasks.pop();
                         }
                         try { task(); }
-                        catch (...) { /* swallow to keep pool alive */ }
+                        catch (...) {}
                     }
                     });
             }
@@ -84,7 +86,11 @@ namespace argb
         {
             using result_t = std::invoke_result_t<F, Args...>;
             auto task_ptr = std::make_shared<std::packaged_task<result_t()>>(
-                std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+                [function = std::forward<F>(f),
+                 arguments = std::make_tuple(std::forward<Args>(args)...)]() mutable -> result_t
+                {
+                    return std::apply(std::move(function), std::move(arguments));
+                }
             );
 
             std::future<result_t> res = task_ptr->get_future();
@@ -94,6 +100,20 @@ namespace argb
             }
             tasks_cv.notify_one();
             return res;
+        }
+
+        template<typename F, typename... Args>
+        auto submit_exclusive(F&& f, Args&&... args)
+        {
+            return submit
+            (
+                [this, function = std::forward<F>(f),
+                 arguments = std::make_tuple(std::forward<Args>(args)...)]() mutable
+                {
+                    std::lock_guard<std::mutex> exclusive_lock(exclusive_tasks_mutex);
+                    return std::apply(std::move(function), std::move(arguments));
+                }
+            );
         }
     };
 
@@ -109,6 +129,7 @@ namespace argb
                 WRITING_RESPONSE_HEADER,
                 WRITING_RESPONSE_BODY,
                 CLOSED,
+                CLOSING,
             };
 
             State                    state;
@@ -120,8 +141,6 @@ namespace argb
             size_t                   response_bytes_sent;
             HttpRequestHandler::Ptr  handler;
 
-            // Mutex por conexión para proteger request/response/handler/state.
-            // Orden de bloqueo: primero siempre tomar 'connections_mutex' y luego 'mutex' de la conexión.
             std::mutex               mutex;
 
             ConnectionContext();
@@ -167,43 +186,43 @@ namespace argb
         ConnectionMap         connections;
         TcpListener           listener;
         std::atomic<bool>     running{};
+        std::atomic<bool>     io_worker_stopped{ true };
         RequestHandlerManager request_handler_manager;
 
-        // Nueva cola y mutex para aceptar conexiones en un hilo separado
         std::queue<TcpSocket> accepted_queue;
         std::mutex            accepted_queue_mutex;
-        std::condition_variable accepted_cv; // notifica al worker de nuevas conexiones
+        std::condition_variable accepted_cv;
 
-        // Cola para notificar al hilo de handlers sobre conexiones listas para procesar
         std::queue<TcpSocket::Handle> handler_queue;
         std::mutex                    handler_queue_mutex;
         std::condition_variable       handler_cv;
 
-        // Mutex para proteger acceso a 'connections' si fuera necesario (stop/join)
+        // Cierres materializados por accept_thread.
+        std::queue<TcpSocket::Handle> close_queue;
+        std::mutex                    close_queue_mutex;
+        std::condition_variable       close_queue_cv;
+
         std::mutex            connections_mutex;
 
-        // Hilo que acepta conexiones y cierra inactivas
+        // Acepta conexiones y cierra sockets solicitados.
         std::thread           accept_thread;
 
-        // Worker que realiza lectura/escritura no bloqueante
+        // Lee/escribe sockets; no cierra físicamente.
         std::thread           worker_thread;
 
-        // Hilo que coordina creación/registro de handlers (ya no ejecuta process directamente)
         std::thread           handler_thread;
 
-        // Hilo dedicado a ejecutar handlers que requieren Lua (único hilo con la instancia de lua::State)
+        // Ejecuta Lua cooperativamente.
         std::thread           lua_thread;
 
-        // Cola y sincronización para tareas que ejecuta el hilo Lua (almacena handles)
         std::deque<TcpSocket::Handle> lua_task_queue;
         std::mutex                   lua_task_queue_mutex;
         std::condition_variable      lua_task_queue_cv;
 
-        // Tabla de corrutinas para cada handle (la corrutina es una función que al ejecutarla devuelve true si ha terminado)
         std::map<TcpSocket::Handle, std::function<bool(HttpRequest&, HttpResponse&)>> lua_coroutines;
         std::mutex lua_coroutines_mutex;
 
-        // ThreadPool para handlers C++ (UN SOLO pool)
+        // Pool único para handlers nativos y tareas auxiliares de Lua.
         ThreadPool thread_pool;
 
     public:
@@ -215,15 +234,12 @@ namespace argb
 
         ~HttpServer() noexcept
         {
-            // Garantizar parada segura al destruir el objeto.
-            // Se captura cualquier excepción para evitar throw desde el destructor.
             try
             {
                 stop();
             }
             catch (...)
             {
-                // swallow: no se permite lanzar desde destructor
             }
         }
 
@@ -242,25 +258,23 @@ namespace argb
         void stop()
         {
             running = false;
-            // despertar hilos bloqueados en waits
             accepted_cv.notify_all();
+            close_queue_cv.notify_all();
             {
                 std::lock_guard<std::mutex> lg(handler_queue_mutex);
             }
             handler_cv.notify_all();
 
-            // Notificar al hilo Lua
             {
                 std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
             }
             lua_task_queue_cv.notify_all();
 
-            // join threads if running
-            if (accept_thread.joinable()) accept_thread.join();
             if (worker_thread.joinable()) worker_thread.join();
             if (handler_thread.joinable()) handler_thread.join();
             if (lua_thread.joinable()) lua_thread.join();
-            // thread_pool destructor se encarga de detener sus hilos
+            close_queue_cv.notify_all();
+            if (accept_thread.joinable()) accept_thread.join();
         }
 
     private:
@@ -272,14 +286,14 @@ namespace argb
         void write_response_body(ConnectionContext& context);
         void run_handlers();
         void close_inactive_connections();
+        void request_connection_close(TcpSocket::Handle handle);
+        void close_pending_connections();
+        void schedule_lua_resume(TcpSocket::Handle handle);
 
-        // Función ejecutada por el hilo de aceptación
         void accept_thread_run();
 
-        // Nueva rutina ejecutada por el hilo de handlers
         void handler_thread_run();
 
-        // Rutina para el hilo único de Lua (ejecuta todos los handlers que requieren Lua)
         void lua_thread_run();
 
     };

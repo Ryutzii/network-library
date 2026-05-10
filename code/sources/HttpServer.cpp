@@ -2,6 +2,7 @@
 /// angel.rodriguez@udit.es
 
 #include <HttpServer.hpp>
+#include <LuaRequestHandler.hpp>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -15,7 +16,6 @@ using std::endl;
 namespace argb
 {
 
-    // Constructores / movimiento
     HttpServer::ConnectionContext::ConnectionContext()
         : state(RECEIVING_REQUEST)
         , last_activity(now())
@@ -30,7 +30,7 @@ namespace argb
         , socket(std::move(other.socket))
         , request(std::move(other.request))
         , response(std::move(other.response))
-        , request_parser(request) // rebind parser to this.request
+        , request_parser(request)
         , handler(std::move(other.handler))
         , response_bytes_sent(other.response_bytes_sent)
     {
@@ -54,80 +54,87 @@ namespace argb
         return nullptr;
     }
 
-    // run: lanza los hilos y vuelve al llamador. stop() se encarga del join/limpieza.
     void HttpServer::run(const Address& address, const Port& port)
     {
         listener.listen(address, port);
         running = true;
+        io_worker_stopped = false;
 
-        // Hilo que acepta nuevas conexiones y las pone en la cola
         accept_thread = std::thread(&HttpServer::accept_thread_run, this);
 
-        // Worker que procesa I/O y encola trabajos para handlers
         worker_thread = std::thread(&HttpServer::transfer_data, this);
 
-        // Hilo que ejecuta handlers (creación + process)
         handler_thread = std::thread(&HttpServer::handler_thread_run, this);
 
-        // Hilo único que ejecutará handlers que necesitan Lua (mismo diseño anterior:
-        // la única instancia de lua::State debe residir en este hilo).
         lua_thread = std::thread(&HttpServer::lua_thread_run, this);
     }
 
-    // Hilo de aceptación: acepta sockets y los encola para el worker.
     void HttpServer::accept_thread_run()
     {
         using namespace std::chrono_literals;
 
-        while (running)
+        while (running || !io_worker_stopped.load())
         {
-            try
-            {
-                if (auto new_socket = listener.accept())
-                {
-                    // Asegurar non-blocking para I/O gestionado por el worker
-                    try
-                    {
-                        new_socket->set_blocking(false);
-                    }
-                    catch (...)
-                    {
-                        // Si no se puede setear, el worker lo detectará al intentar I/O
-                    }
+            close_pending_connections();
 
-                    {
-                        std::lock_guard<std::mutex> lock(accepted_queue_mutex);
-                        accepted_queue.push(std::move(*new_socket));
-                    }
-                    accepted_cv.notify_one();
-                }
-                else
+            if (running)
+            {
+                try
                 {
-                    // No había conexión; evitar busy-loop
-                    std::this_thread::sleep_for(10ms);
+                    if (auto new_socket = listener.accept())
+                    {
+                        try
+                        {
+                            new_socket->set_blocking(false);
+                        }
+                        catch (...)
+                        {
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(accepted_queue_mutex);
+                            accepted_queue.push(std::move(*new_socket));
+                        }
+                        accepted_cv.notify_one();
+                    }
+                    else
+                    {
+                        std::unique_lock<std::mutex> close_lock(close_queue_mutex);
+                        close_queue_cv.wait_for(close_lock, 10ms, [this]
+                        {
+                            return !running || !close_queue.empty();
+                        });
+                    }
+                }
+                catch (const NetworkException& ex)
+                {
+                    cout << "Error accepting: " << ex << endl;
+                    std::this_thread::sleep_for(50ms);
                 }
             }
-            catch (const NetworkException& ex)
+            else
             {
-                cout << "Error accepting: " << ex << endl;
-                std::this_thread::sleep_for(50ms);
+                std::unique_lock<std::mutex> close_lock(close_queue_mutex);
+                close_queue_cv.wait_for(close_lock, 10ms, [this]
+                {
+                    return io_worker_stopped.load() || !close_queue.empty();
+                });
             }
         }
+
+        close_pending_connections();
     }
 
-    // Worker: consume accepted_queue, gestiona conexiones (I/O) y encola handlers.
     void HttpServer::transfer_data()
     {
         using namespace std::chrono_literals;
 
         while (running)
         {
-            // 1) Mover sockets de la cola aceptada al mapa de conexiones
             {
                 std::unique_lock<std::mutex> qlock(accepted_queue_mutex);
                 if (accepted_queue.empty())
                 {
-                    // Despertar periódicamente para tareas (timeouts, checks)
                     accepted_cv.wait_for(qlock, 200ms);
                 }
 
@@ -151,7 +158,6 @@ namespace argb
                 }
             }
 
-            // 2) Primera fase: I/O no bloqueante (lectura/escritura) para cada conexión
             {
                 std::lock_guard<std::mutex> conn_lock(connections_mutex);
                 for (auto it = connections.begin(); it != connections.end(); )
@@ -164,10 +170,8 @@ namespace argb
                         {
                         case ConnectionContext::RECEIVING_REQUEST:
                             receive_request(ctx);
-                            // si el parser terminó, receive_request seteará RUNNING_HANDLER
                             if (ctx.state == ConnectionContext::RUNNING_HANDLER)
                             {
-                                // encolar para handlers (protección mínima)
                                 const auto handle = it->first;
                                 {
                                     std::lock_guard<std::mutex> hlock(handler_queue_mutex);
@@ -186,10 +190,10 @@ namespace argb
                             break;
 
                         case ConnectionContext::RUNNING_HANDLER:
-                            // Ya encolada para handler; no hacer nada en I/O
                             break;
 
                         case ConnectionContext::CLOSED:
+                        case ConnectionContext::CLOSING:
                             break;
                         }
                     }
@@ -201,32 +205,33 @@ namespace argb
 
                     if (ctx.state == ConnectionContext::CLOSED)
                     {
-                        try { ctx.socket.close(); }
-                        catch (...) {}
-                        it = connections.erase(it);
+                        request_connection_close(it->first);
+                        ctx.state = ConnectionContext::CLOSING;
                     }
-                    else
-                        ++it;
+
+                    ++it;
                 }
             }
 
-            // 3) Cerrar inactivas
             close_inactive_connections();
         }
 
-        // Limpieza final: cerrar sockets y vaciar mapa
         {
             std::lock_guard<std::mutex> conn_lock(connections_mutex);
             for (auto& kv : connections)
             {
-                try { kv.second.socket.close(); }
-                catch (...) {}
+                if (kv.second.state != ConnectionContext::CLOSING)
+                {
+                    kv.second.state = ConnectionContext::CLOSED;
+                    request_connection_close(kv.first);
+                }
             }
-            connections.clear();
         }
+
+        io_worker_stopped = true;
+        close_queue_cv.notify_all();
     }
 
-    // Hilo dedicado a ejecutar handlers. Consume handler_queue.
     void HttpServer::handler_thread_run()
     {
         using namespace std::chrono_literals;
@@ -235,7 +240,6 @@ namespace argb
         {
             std::vector<TcpSocket::Handle> batch;
 
-            // Esperar hasta que haya trabajo o se pare el servidor
             {
                 std::unique_lock<std::mutex> hl(handler_queue_mutex);
                 if (handler_queue.empty())
@@ -252,13 +256,11 @@ namespace argb
 
             if (batch.empty())
             {
-                // nada que hacer ahora
                 continue;
             }
 
             for (auto handle : batch)
             {
-                // Confirmar estado bajo connections_mutex
                 {
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
@@ -266,7 +268,6 @@ namespace argb
                     if (it->second.state != ConnectionContext::RUNNING_HANDLER) continue;
                 }
 
-                // Snapshot de method/path si necesitamos crear handler (bloquea connections -> ctx.mutex en ese orden)
                 HttpRequest::Method method_snapshot{};
                 std::string path_snapshot;
                 {
@@ -285,7 +286,6 @@ namespace argb
                 if (!path_snapshot.empty())
                 {
                     created_handler = request_handler_manager.create_handler(method_snapshot, path_snapshot);
-                    // almacenar handler bajo lock (connections -> ctx.mutex)
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
                     if (it == connections.end()) continue;
@@ -296,7 +296,6 @@ namespace argb
                             it->second.handler = std::move(created_handler);
                         else
                         {
-                            // No hay handler: generar 404 y pasar a escritura
                             static constexpr std::string_view not_found_message = "File not found";
 
                             HttpResponse::Serializer(it->second.response)
@@ -315,34 +314,36 @@ namespace argb
                     }
                 }
 
-                // Ejecutar handler fuera del lock o delegar a worker Lua
                 HttpRequestHandler* handler_raw = nullptr;
+                bool handler_requires_lua = false;
+                {
+                    std::lock_guard<std::mutex> conn_lock(connections_mutex);
+                    auto it = connections.find(handle);
+                    if (it == connections.end()) continue;
+                    std::lock_guard<std::mutex> ctx_lock(it->second.mutex);
+                    if (!it->second.handler) continue;
+                    handler_raw = it->second.handler.operator->();
+                    handler_requires_lua = handler_raw->requires_lua();
+                }
+
+                if (!handler_raw) continue;
+
+                if (handler_requires_lua)
+                {
+                    schedule_lua_resume(handle);
+                    continue;
+                }
+
                 HttpRequest request_snapshot;
                 {
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
                     if (it == connections.end()) continue;
                     std::lock_guard<std::mutex> ctx_lock(it->second.mutex);
-                    if (!it->second.handler) continue; // ya tratado como 404
-                    handler_raw = it->second.handler.operator->();
-                    // Mover la request fuera del contexto para ejecutar en pool sin riesgo
+                    if (it->second.state != ConnectionContext::RUNNING_HANDLER) continue;
                     request_snapshot = std::move(it->second.request);
                 }
 
-                if (!handler_raw) continue;
-
-                // Si el handler requiere Lua, encolarlo para el worker Lua (hilo dedicado)
-                if (handler_raw->requires_lua())
-                {
-                    {
-                        std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
-                        lua_task_queue.push_back(handle);
-                    }
-                    lua_task_queue_cv.notify_one();
-                    continue;
-                }
-
-                // Enviar ejecución del handler al ThreadPool (paralelismo)
                 auto work_fn = [this, handle, handler_raw, request_snapshot = std::move(request_snapshot)]() mutable
                     {
                         HttpResponse response_local;
@@ -377,14 +378,12 @@ namespace argb
                             return;
                         }
 
-                        // Volver al mapa de conexiones y actualizar estado/respuesta
                         {
                             std::lock_guard<std::mutex> conn_lock(connections_mutex);
                             auto it = connections.find(handle);
                             if (it == connections.end()) return;
                             std::lock_guard<std::mutex> ctx_lock(it->second.mutex);
 
-                            // Mover la respuesta generada al contexto
                             it->second.response = std::move(response_local);
 
                             if (finished)
@@ -395,7 +394,7 @@ namespace argb
                             }
                             else
                             {
-                                // No terminado: re-enqueue para intentar más tarde.
+                                it->second.request = std::move(request_snapshot);
                                 it->second.last_activity = now();
                                 {
                                     std::lock_guard<std::mutex> hlock(handler_queue_mutex);
@@ -406,14 +405,12 @@ namespace argb
                         }
                     };
 
-                // Submit al pool (no esperamos aquí)
                 try
                 {
                     thread_pool.submit(std::move(work_fn));
                 }
                 catch (...)
                 {
-                    // Si la sumisión falla, cerrar la conexión
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
                     if (it != connections.end())
@@ -423,18 +420,115 @@ namespace argb
                     }
                 }
 
-                // pequeña pausa no necesaria aquí; el work se ejecutará en paralelo
             }
         }
     }
 
-    // Hilo Lua: ejecuta corrutinas de forma serializada (única instancia de lua::State aquí)
+    void HttpServer::request_connection_close(TcpSocket::Handle handle)
+    {
+        {
+            std::lock_guard<std::mutex> close_lock(close_queue_mutex);
+            close_queue.push(handle);
+        }
+        close_queue_cv.notify_one();
+    }
+
+    void HttpServer::close_pending_connections()
+    {
+        std::vector<TcpSocket::Handle> pending_closes;
+
+        {
+            std::lock_guard<std::mutex> close_lock(close_queue_mutex);
+            while (!close_queue.empty())
+            {
+                pending_closes.push_back(close_queue.front());
+                close_queue.pop();
+            }
+        }
+
+        if (pending_closes.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> conn_lock(connections_mutex);
+
+        for (auto handle : pending_closes)
+        {
+            auto it = connections.find(handle);
+            if (it == connections.end())
+            {
+                continue;
+            }
+
+            std::unique_lock<std::mutex> ctx_lock(it->second.mutex);
+
+            if (it->second.state != ConnectionContext::CLOSING &&
+                it->second.state != ConnectionContext::CLOSED)
+            {
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                lua_coroutines.erase(handle);
+            }
+
+            try
+            {
+                it->second.socket.shutdown_send();
+                it->second.socket.shutdown_receive();
+            }
+            catch (...)
+            {
+            }
+
+            try
+            {
+                it->second.socket.close();
+            }
+            catch (...)
+            {
+            }
+
+            ctx_lock.unlock();
+            connections.erase(it);
+        }
+    }
+
+    void HttpServer::schedule_lua_resume(TcpSocket::Handle handle)
+    {
+        try
+        {
+            thread_pool.submit([this, handle]
+                {
+                    if (!running) return;
+
+                    {
+                        std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
+                        lua_task_queue.push_back(handle);
+                    }
+                    lua_task_queue_cv.notify_one();
+                });
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
+            lua_task_queue.push_back(handle);
+            lua_task_queue_cv.notify_one();
+        }
+    }
+
     void HttpServer::lua_thread_run()
     {
         using namespace std::chrono_literals;
 
-        // Inicializar estado Lua aquí si es necesario (vive en este hilo)
-        // p.e. lua::State lua_state;
+        LuaRequestHandler::StateScope lua_state_scope;
+
+        if (!LuaRequestHandler::is_lua_available())
+        {
+            cout << "Lua VM is not available: Lua headers/runtime were not found when building this library." << endl;
+        }
 
         while (running || !lua_task_queue.empty())
         {
@@ -459,74 +553,112 @@ namespace argb
 
             for (auto handle : batch)
             {
-                // Confirmar que la conexión y handler siguen válidos
+                if (!LuaRequestHandler::is_lua_available())
                 {
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
-                    if (it == connections.end()) continue;
-                    if (it->second.state != ConnectionContext::RUNNING_HANDLER) continue;
-                    if (!it->second.handler) continue;
+                    if (it != connections.end())
+                    {
+                        std::lock_guard<std::mutex> ctx_lock(it->second.mutex);
+                        if (it->second.state == ConnectionContext::RUNNING_HANDLER && it->second.handler)
+                        {
+                            it->second.handler->send_plain_text_response
+                            (
+                                it->second.response,
+                                500,
+                                "Lua VM is not available"
+                            );
+                            it->second.state = ConnectionContext::WRITING_RESPONSE_HEADER;
+                            it->second.response_bytes_sent = 0;
+                            it->second.last_activity = now();
+                        }
+                    }
+                    continue;
                 }
 
-                // Bloquear connections_mutex -> ctx.mutex (en ese orden), luego liberar connections_mutex
-                HttpRequestHandler* handler_raw = nullptr;
                 {
                     std::unique_lock<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
                     if (it == connections.end()) continue;
                     std::unique_lock<std::mutex> ctx_lock(it->second.mutex);
-                    // Ahora podemos soltar connections_mutex y mantener ctx_lock mientras ejecutamos Lua
                     conn_lock.unlock();
 
-                    handler_raw = it->second.handler.operator->();
-                    if (!handler_raw) continue;
+                    if (it->second.state != ConnectionContext::RUNNING_HANDLER) continue;
+                    if (!it->second.handler) continue;
 
+                    auto* handler_raw = it->second.handler.operator->();
                     bool finished = false;
+
                     try
                     {
-                        // Ejecutar en el hilo Lua con protección del mutex de la conexión
-                        finished = handler_raw->process(it->second.request, it->second.response);
+                        std::function<bool(HttpRequest&, HttpResponse&)>* coroutine = nullptr;
+
+                        {
+                            std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                            auto coroutine_it = lua_coroutines.find(handle);
+
+                            if (coroutine_it == lua_coroutines.end())
+                            {
+                                auto created_coroutine = handler_raw->create_lua_coroutine();
+
+                                if (!created_coroutine)
+                                {
+                                    created_coroutine = [handler_raw](HttpRequest& request, HttpResponse& response)
+                                    {
+                                        return handler_raw->process(request, response);
+                                    };
+                                }
+
+                                coroutine_it = lua_coroutines.emplace(handle, std::move(created_coroutine)).first;
+                            }
+
+                            coroutine = &coroutine_it->second;
+                        }
+
+                        finished = (*coroutine)(it->second.request, it->second.response);
                     }
                     catch (const std::exception& ex)
                     {
-                        cout << "Lua-handler exception: " << ex.what() << endl;
+                        cout << "Lua coroutine exception: " << ex.what() << endl;
                         it->second.state = ConnectionContext::CLOSED;
+                        std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                        lua_coroutines.erase(handle);
                         continue;
                     }
                     catch (...)
                     {
-                        cout << "Lua-handler unknown exception." << endl;
+                        cout << "Lua coroutine unknown exception." << endl;
                         it->second.state = ConnectionContext::CLOSED;
+                        std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                        lua_coroutines.erase(handle);
                         continue;
                     }
 
-                    // Actualizar estado según resultado (aún bajo ctx_lock)
                     if (finished)
                     {
+                        {
+                            std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                            lua_coroutines.erase(handle);
+                        }
+
                         it->second.state = ConnectionContext::WRITING_RESPONSE_HEADER;
                         it->second.response_bytes_sent = 0;
                         it->second.last_activity = now();
                     }
                     else
                     {
-                        // No terminado: re-enqueue para intentar más tarde en el hilo Lua (ejecución cooperativa)
                         it->second.last_activity = now();
-                        {
-                            std::lock_guard<std::mutex> lg(lua_task_queue_mutex);
-                            lua_task_queue.push_back(handle);
-                        }
-                        lua_task_queue_cv.notify_one();
+                        schedule_lua_resume(handle);
                         std::this_thread::sleep_for(1ms);
                     }
-                    // ctx_lock se libera al salir del scope
                 }
             }
         }
 
-        // Destruir estado Lua si fue inicializado
+        std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+        lua_coroutines.clear();
     }
 
-    // Recibe datos desde el socket y alimenta el parser.
     void HttpServer::receive_request(ConnectionContext& context)
     {
         IoBuffer buffer;
@@ -540,7 +672,6 @@ namespace argb
 
         if (received == Socket::receive_empty)
         {
-            // nothing to read now (non-blocking)
             return;
         }
 
@@ -550,7 +681,6 @@ namespace argb
 
         if (parsed)
         {
-            // marcar para ejecución de handler en la fase de handlers
             context.state = ConnectionContext::RUNNING_HANDLER;
         }
     }
@@ -607,40 +737,31 @@ namespace argb
         }
     }
 
-    // Cierra conexiones que han estado inactivas más tiempo que connection_timeout.
     void HttpServer::close_inactive_connections()
     {
         const auto current_time = now();
 
         std::lock_guard<std::mutex> conn_lock(connections_mutex);
 
-        for (auto it = connections.begin(); it != connections.end(); )
+        for (auto& [handle, ctx] : connections)
         {
-            auto& ctx = it->second;
-
-            // Adquirir el mutex de la conexión (si está ocupado, respetamos orden connections_mutex -> ctx.mutex)
             std::lock_guard<std::mutex> ctx_lock(ctx.mutex);
 
             if (ctx.state == ConnectionContext::CLOSED)
             {
-                try { ctx.socket.close(); }
-                catch (...) {}
-                it = connections.erase(it);
+                request_connection_close(handle);
+                ctx.state = ConnectionContext::CLOSING;
                 continue;
             }
 
-            if (current_time - ctx.last_activity > connection_timeout)
+            if (ctx.state != ConnectionContext::CLOSING &&
+                current_time - ctx.last_activity > connection_timeout)
             {
-                cout << "Closing connection " << it->first << " due to timeout." << endl;
-                try { ctx.socket.shutdown_send(); ctx.socket.shutdown_receive(); ctx.socket.close(); }
-                catch (...) {}
-                it = connections.erase(it);
-            }
-            else
-            {
-                ++it;
+                cout << "Closing connection " << handle << " due to timeout." << endl;
+                ctx.state = ConnectionContext::CLOSING;
+                request_connection_close(handle);
             }
         }
     }
 
-} // namespace argb
+}
