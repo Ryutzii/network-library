@@ -26,6 +26,7 @@
 #include <future>
 #include <vector>
 #include <algorithm>
+#include <tuple>
 
 namespace argb
 {
@@ -84,7 +85,11 @@ namespace argb
         {
             using result_t = std::invoke_result_t<F, Args...>;
             auto task_ptr = std::make_shared<std::packaged_task<result_t()>>(
-                std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+                [function = std::forward<F>(f),
+                 arguments = std::make_tuple(std::forward<Args>(args)...)]() mutable -> result_t
+                {
+                    return std::apply(std::move(function), std::move(arguments));
+                }
             );
 
             std::future<result_t> res = task_ptr->get_future();
@@ -99,6 +104,24 @@ namespace argb
 
     class HttpServer
     {
+
+        class LuaVirtualMachine
+        {
+        public:
+
+            LuaVirtualMachine();
+            ~LuaVirtualMachine();
+
+            LuaVirtualMachine(const LuaVirtualMachine&) = delete;
+            LuaVirtualMachine& operator = (const LuaVirtualMachine&) = delete;
+
+            bool is_available() const noexcept;
+
+        private:
+
+            struct Implementation;
+            std::unique_ptr<Implementation> implementation;
+        };
 
         struct ConnectionContext
         {
@@ -182,10 +205,13 @@ namespace argb
         // Mutex para proteger acceso a 'connections' si fuera necesario (stop/join)
         std::mutex            connections_mutex;
 
-        // Hilo que acepta conexiones y cierra inactivas
+        // Hilo que acepta conexiones HTTP y las entrega al worker de I/O.
+        // El cierre de conexiones pertenece al worker_thread, porque es el único hilo que
+        // lee/escribe sockets y puede cerrar sin competir con operaciones de I/O activas.
         std::thread           accept_thread;
 
-        // Worker que realiza lectura/escritura no bloqueante
+        // Worker que realiza lectura/escritura no bloqueante y cierra conexiones completadas,
+        // erróneas o inactivas.
         std::thread           worker_thread;
 
         // Hilo que coordina creación/registro de handlers (ya no ejecuta process directamente)
@@ -203,13 +229,18 @@ namespace argb
         std::map<TcpSocket::Handle, std::function<bool(HttpRequest&, HttpResponse&)>> lua_coroutines;
         std::mutex lua_coroutines_mutex;
 
-        // ThreadPool para handlers C++ (UN SOLO pool)
+        // ThreadPool para handlers HTTP nativos C++.
         ThreadPool thread_pool;
+
+        // ThreadPool separado para tareas asíncronas de Lua: sus workers no tocan la VM,
+        // solo programan/reprograman trabajo que el lua_thread reanuda de forma serializada.
+        ThreadPool lua_async_thread_pool;
 
     public:
 
         HttpServer()
             : thread_pool(std::max<size_t>(1, std::thread::hardware_concurrency()))
+            , lua_async_thread_pool(std::max<size_t>(1, std::thread::hardware_concurrency()))
         {
         }
 
@@ -272,6 +303,7 @@ namespace argb
         void write_response_body(ConnectionContext& context);
         void run_handlers();
         void close_inactive_connections();
+        void schedule_lua_resume(TcpSocket::Handle handle);
 
         // Función ejecutada por el hilo de aceptación
         void accept_thread_run();

@@ -110,6 +110,8 @@ namespace argb
 
     public:
 
+        virtual ~HttpRequestHandler() = default;
+
         /** Handles an incoming HTTP request and produces an appropriate response. This method must be implemented by
           * derived classes to provide custom request handling logic. The response can be populated incrementally,
           * allowing for asynchronous processing if needed. The method should return true when the response is fully
