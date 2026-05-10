@@ -8,6 +8,8 @@
 #include <memory>
 #include <functional>
 
+struct lua_State;
+
 namespace argb
 {
 
@@ -139,7 +141,17 @@ namespace argb
           * puede envolver llamadas a la única instancia de lua::State que exista.
           *
           * Por defecto devuelve una función vacía (no hay corrutina).
+          *
+          * La sobrecarga con lua_State recibe la VM real que vive en el hilo Lua del servidor.
+          * Los handlers Lua deben crear ahí su corrutina real de Lua (por ejemplo con lua_newthread)
+          * y devolver una función que la reanude (por ejemplo con lua_resume) hasta que termine.
           */
+        virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine(lua_State* lua_state)
+        {
+            (void) lua_state;
+            return create_lua_coroutine();
+        }
+
         virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine()
         {
             return {};

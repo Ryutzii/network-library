@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <tuple>
 
+struct lua_State;
+
 namespace argb
 {
 
@@ -116,6 +118,7 @@ namespace argb
             LuaVirtualMachine& operator = (const LuaVirtualMachine&) = delete;
 
             bool is_available() const noexcept;
+            lua_State* get_state() const noexcept;
 
         private:
 
@@ -132,6 +135,7 @@ namespace argb
                 WRITING_RESPONSE_HEADER,
                 WRITING_RESPONSE_BODY,
                 CLOSED,
+                CLOSING,
             };
 
             State                    state;
@@ -190,6 +194,7 @@ namespace argb
         ConnectionMap         connections;
         TcpListener           listener;
         std::atomic<bool>     running{};
+        std::atomic<bool>     io_worker_stopped{ true };
         RequestHandlerManager request_handler_manager;
 
         // Nueva cola y mutex para aceptar conexiones en un hilo separado
@@ -202,16 +207,20 @@ namespace argb
         std::mutex                    handler_queue_mutex;
         std::condition_variable       handler_cv;
 
+        // Cola de cierres que consume accept_thread para que ese hilo acepte y cierre conexiones HTTP.
+        std::queue<TcpSocket::Handle> close_queue;
+        std::mutex                    close_queue_mutex;
+        std::condition_variable       close_queue_cv;
+
         // Mutex para proteger acceso a 'connections' si fuera necesario (stop/join)
         std::mutex            connections_mutex;
 
-        // Hilo que acepta conexiones HTTP y las entrega al worker de I/O.
-        // El cierre de conexiones pertenece al worker_thread, porque es el único hilo que
-        // lee/escribe sockets y puede cerrar sin competir con operaciones de I/O activas.
+        // Hilo que acepta conexiones HTTP y materializa el cierre de conexiones.
+        // Los demás hilos solo marcan conexiones como cerradas y solicitan el cierre aquí.
         std::thread           accept_thread;
 
-        // Worker que realiza lectura/escritura no bloqueante y cierra conexiones completadas,
-        // erróneas o inactivas.
+        // Worker que realiza lectura/escritura no bloqueante y detecta conexiones completadas,
+        // erróneas o inactivas; el cierre físico se delega en accept_thread.
         std::thread           worker_thread;
 
         // Hilo que coordina creación/registro de handlers (ya no ejecuta process directamente)
@@ -275,6 +284,7 @@ namespace argb
             running = false;
             // despertar hilos bloqueados en waits
             accepted_cv.notify_all();
+            close_queue_cv.notify_all();
             {
                 std::lock_guard<std::mutex> lg(handler_queue_mutex);
             }
@@ -287,10 +297,11 @@ namespace argb
             lua_task_queue_cv.notify_all();
 
             // join threads if running
-            if (accept_thread.joinable()) accept_thread.join();
             if (worker_thread.joinable()) worker_thread.join();
             if (handler_thread.joinable()) handler_thread.join();
             if (lua_thread.joinable()) lua_thread.join();
+            close_queue_cv.notify_all();
+            if (accept_thread.joinable()) accept_thread.join();
             // thread_pool destructor se encarga de detener sus hilos
         }
 
@@ -303,6 +314,8 @@ namespace argb
         void write_response_body(ConnectionContext& context);
         void run_handlers();
         void close_inactive_connections();
+        void request_connection_close(TcpSocket::Handle handle);
+        void close_pending_connections();
         void schedule_lua_resume(TcpSocket::Handle handle);
 
         // Función ejecutada por el hilo de aceptación

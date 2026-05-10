@@ -73,6 +73,15 @@ namespace argb
 #endif
     }
 
+    lua_State* HttpServer::LuaVirtualMachine::get_state() const noexcept
+    {
+#if ARGB_NETWORK_LIBRARY_HAS_LUA
+        return implementation ? implementation->state : nullptr;
+#else
+        return nullptr;
+#endif
+    }
+
     // Constructores / movimiento
     HttpServer::ConnectionContext::ConnectionContext()
         : state(RECEIVING_REQUEST)
@@ -117,6 +126,7 @@ namespace argb
     {
         listener.listen(address, port);
         running = true;
+        io_worker_stopped = false;
 
         // Hilo que acepta nuevas conexiones y las pone en la cola
         accept_thread = std::thread(&HttpServer::accept_thread_run, this);
@@ -132,45 +142,64 @@ namespace argb
         lua_thread = std::thread(&HttpServer::lua_thread_run, this);
     }
 
-    // Hilo de aceptación: acepta sockets y los encola para el worker.
+    // Hilo de aceptación y cierre: acepta sockets y materializa el cierre de conexiones HTTP.
     void HttpServer::accept_thread_run()
     {
         using namespace std::chrono_literals;
 
-        while (running)
+        while (running || !io_worker_stopped.load())
         {
-            try
-            {
-                if (auto new_socket = listener.accept())
-                {
-                    // Asegurar non-blocking para I/O gestionado por el worker
-                    try
-                    {
-                        new_socket->set_blocking(false);
-                    }
-                    catch (...)
-                    {
-                        // Si no se puede setear, el worker lo detectará al intentar I/O
-                    }
+            close_pending_connections();
 
-                    {
-                        std::lock_guard<std::mutex> lock(accepted_queue_mutex);
-                        accepted_queue.push(std::move(*new_socket));
-                    }
-                    accepted_cv.notify_one();
-                }
-                else
+            if (running)
+            {
+                try
                 {
-                    // No había conexión; evitar busy-loop
-                    std::this_thread::sleep_for(10ms);
+                    if (auto new_socket = listener.accept())
+                    {
+                        // Asegurar non-blocking para I/O gestionado por el worker
+                        try
+                        {
+                            new_socket->set_blocking(false);
+                        }
+                        catch (...)
+                        {
+                            // Si no se puede setear, el worker lo detectará al intentar I/O
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(accepted_queue_mutex);
+                            accepted_queue.push(std::move(*new_socket));
+                        }
+                        accepted_cv.notify_one();
+                    }
+                    else
+                    {
+                        // No había conexión; esperar también a posibles solicitudes de cierre.
+                        std::unique_lock<std::mutex> close_lock(close_queue_mutex);
+                        close_queue_cv.wait_for(close_lock, 10ms, [this]
+                        {
+                            return !running || !close_queue.empty();
+                        });
+                    }
+                }
+                catch (const NetworkException& ex)
+                {
+                    cout << "Error accepting: " << ex << endl;
+                    std::this_thread::sleep_for(50ms);
                 }
             }
-            catch (const NetworkException& ex)
+            else
             {
-                cout << "Error accepting: " << ex << endl;
-                std::this_thread::sleep_for(50ms);
+                std::unique_lock<std::mutex> close_lock(close_queue_mutex);
+                close_queue_cv.wait_for(close_lock, 10ms, [this]
+                {
+                    return io_worker_stopped.load() || !close_queue.empty();
+                });
             }
         }
+
+        close_pending_connections();
     }
 
     // Worker: consume accepted_queue, gestiona conexiones (I/O) y encola handlers.
@@ -248,6 +277,7 @@ namespace argb
                             break;
 
                         case ConnectionContext::CLOSED:
+                        case ConnectionContext::CLOSING:
                             break;
                         }
                     }
@@ -259,16 +289,11 @@ namespace argb
 
                     if (ctx.state == ConnectionContext::CLOSED)
                     {
-                        {
-                            std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
-                            lua_coroutines.erase(it->first);
-                        }
-                        try { ctx.socket.close(); }
-                        catch (...) {}
-                        it = connections.erase(it);
+                        request_connection_close(it->first);
+                        ctx.state = ConnectionContext::CLOSING;
                     }
-                    else
-                        ++it;
+
+                    ++it;
                 }
             }
 
@@ -276,20 +301,21 @@ namespace argb
             close_inactive_connections();
         }
 
-        // Limpieza final: cerrar sockets y vaciar mapa
+        // Limpieza final: pedir al hilo de aceptación/cierre que cierre los sockets restantes.
         {
             std::lock_guard<std::mutex> conn_lock(connections_mutex);
             for (auto& kv : connections)
             {
-                try { kv.second.socket.close(); }
-                catch (...) {}
+                if (kv.second.state != ConnectionContext::CLOSING)
+                {
+                    kv.second.state = ConnectionContext::CLOSED;
+                    request_connection_close(kv.first);
+                }
             }
-            {
-                std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
-                lua_coroutines.clear();
-            }
-            connections.clear();
         }
+
+        io_worker_stopped = true;
+        close_queue_cv.notify_all();
     }
 
     // Hilo dedicado a ejecutar handlers. Consume handler_queue.
@@ -501,6 +527,78 @@ namespace argb
         }
     }
 
+    void HttpServer::request_connection_close(TcpSocket::Handle handle)
+    {
+        {
+            std::lock_guard<std::mutex> close_lock(close_queue_mutex);
+            close_queue.push(handle);
+        }
+        close_queue_cv.notify_one();
+    }
+
+    void HttpServer::close_pending_connections()
+    {
+        std::vector<TcpSocket::Handle> pending_closes;
+
+        {
+            std::lock_guard<std::mutex> close_lock(close_queue_mutex);
+            while (!close_queue.empty())
+            {
+                pending_closes.push_back(close_queue.front());
+                close_queue.pop();
+            }
+        }
+
+        if (pending_closes.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> conn_lock(connections_mutex);
+
+        for (auto handle : pending_closes)
+        {
+            auto it = connections.find(handle);
+            if (it == connections.end())
+            {
+                continue;
+            }
+
+            std::unique_lock<std::mutex> ctx_lock(it->second.mutex);
+
+            if (it->second.state != ConnectionContext::CLOSING &&
+                it->second.state != ConnectionContext::CLOSED)
+            {
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
+                lua_coroutines.erase(handle);
+            }
+
+            try
+            {
+                it->second.socket.shutdown_send();
+                it->second.socket.shutdown_receive();
+            }
+            catch (...)
+            {
+            }
+
+            try
+            {
+                it->second.socket.close();
+            }
+            catch (...)
+            {
+            }
+
+            ctx_lock.unlock();
+            connections.erase(it);
+        }
+    }
+
     void HttpServer::schedule_lua_resume(TcpSocket::Handle handle)
     {
         try
@@ -608,7 +706,7 @@ namespace argb
 
                             if (coroutine_it == lua_coroutines.end())
                             {
-                                auto created_coroutine = handler_raw->create_lua_coroutine();
+                                auto created_coroutine = handler_raw->create_lua_coroutine(lua_vm.get_state());
 
                                 // Compatibilidad: si un handler Lua antiguo aún no implementa corrutinas,
                                 // se adapta process() como una corrutina de un único paso.
@@ -753,46 +851,31 @@ namespace argb
         }
     }
 
-    // Cierra conexiones que han estado inactivas más tiempo que connection_timeout.
+    // Detecta conexiones inactivas y solicita su cierre al hilo de aceptación/cierre.
     void HttpServer::close_inactive_connections()
     {
         const auto current_time = now();
 
         std::lock_guard<std::mutex> conn_lock(connections_mutex);
 
-        for (auto it = connections.begin(); it != connections.end(); )
+        for (auto& [handle, ctx] : connections)
         {
-            auto& ctx = it->second;
-
             // Adquirir el mutex de la conexión (si está ocupado, respetamos orden connections_mutex -> ctx.mutex)
             std::lock_guard<std::mutex> ctx_lock(ctx.mutex);
 
             if (ctx.state == ConnectionContext::CLOSED)
             {
-                {
-                    std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
-                    lua_coroutines.erase(it->first);
-                }
-                try { ctx.socket.close(); }
-                catch (...) {}
-                it = connections.erase(it);
+                request_connection_close(handle);
+                ctx.state = ConnectionContext::CLOSING;
                 continue;
             }
 
-            if (current_time - ctx.last_activity > connection_timeout)
+            if (ctx.state != ConnectionContext::CLOSING &&
+                current_time - ctx.last_activity > connection_timeout)
             {
-                cout << "Closing connection " << it->first << " due to timeout." << endl;
-                {
-                    std::lock_guard<std::mutex> coroutine_lock(lua_coroutines_mutex);
-                    lua_coroutines.erase(it->first);
-                }
-                try { ctx.socket.shutdown_send(); ctx.socket.shutdown_receive(); ctx.socket.close(); }
-                catch (...) {}
-                it = connections.erase(it);
-            }
-            else
-            {
-                ++it;
+                cout << "Closing connection " << handle << " due to timeout." << endl;
+                ctx.state = ConnectionContext::CLOSING;
+                request_connection_close(handle);
             }
         }
     }
