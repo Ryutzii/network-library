@@ -23,6 +23,7 @@
     <ClInclude Include="..\..\code\headers\NetworkSetup.hpp" />
     <ClInclude Include="..\..\code\headers\Port.hpp" />
     <ClInclude Include="..\..\code\headers\HttpRequestHandler.hpp" />
+    <ClInclude Include="..\..\code\headers\LuaRequestHandler.hpp" />
     <ClInclude Include="..\..\code\headers\snippets.hpp" />
     <ClInclude Include="..\..\code\headers\Socket.hpp" />
     <ClInclude Include="..\..\code\headers\NetworkException.hpp" />
@@ -35,6 +36,7 @@
     <ClCompile Include="..\..\code\sources\HttpRequest.cpp" />
     <ClCompile Include="..\..\code\sources\HttpResponse.cpp" />
     <ClCompile Include="..\..\code\sources\HttpServer.cpp" />
+    <ClCompile Include="..\..\code\sources\LuaRequestHandler.cpp" />
     <ClCompile Include="..\..\code\sources\MimeType.cpp" />
     <ClCompile Include="..\..\code\sources\winsock2\Address.cpp" />
     <ClCompile Include="..\..\code\sources\winsock2\NetworkSetup.cpp" />

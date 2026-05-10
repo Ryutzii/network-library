@@ -8,7 +8,6 @@
 #include <memory>
 #include <functional>
 
-struct lua_State;
 
 namespace argb
 {
@@ -115,43 +114,21 @@ namespace argb
         virtual ~HttpRequestHandler() = default;
 
         /** Handles an incoming HTTP request and produces an appropriate response. This method must be implemented by
-          * derived classes to provide custom request handling logic. The response can be populated incrementally,
-          * allowing for asynchronous processing if needed. The method should return true when the response is fully
-          * ready to be sent back to the client, or false if the handler is still processing.
-          * 
-          * @param request  The incoming HTTP request.
-          * @param response The HTTP response to be populated.
-          * 
-          * @return True if the handler finished processing the request and the response is ready to be sent;
-          *     false if the handler is still processing.
+          * derived classes to provide custom request handling logic for processing incoming HTTP requests and generating
+          * appropriate HTTP responses.
           */
         virtual bool process (const HttpRequest & request, HttpResponse & response) = 0;
 
         /** Indica si este handler necesita ejecutarse en el hilo único de Lua.
-          * Por defecto devuelve false; los handlers que integren Lua deben sobreescribirlo para devolver true.
+          * Por defecto devuelve false; LuaRequestHandler lo sobreescribe para devolver true.
           */
         virtual bool requires_lua() const { return false; }
 
         /** Crear una "corrutina" ejecutable en el hilo Lua.
-          * Debe devolverse una std::function<bool()> que:
+          * Debe devolverse una std::function que:
           *  - al invocarse reanuda la corrutina y devuelve true si ha terminado;
           *  - devuelve false si la corrutina se ha yield/pausado y debe reprogramarse.
-          *
-          * Esta función se llamará siempre desde el hilo Lua, por tanto la creación de la corrutina
-          * puede envolver llamadas a la única instancia de lua::State que exista.
-          *
-          * Por defecto devuelve una función vacía (no hay corrutina).
-          *
-          * La sobrecarga con lua_State recibe la VM real que vive en el hilo Lua del servidor.
-          * Los handlers Lua deben crear ahí su corrutina real de Lua (por ejemplo con lua_newthread)
-          * y devolver una función que la reanude (por ejemplo con lua_resume) hasta que termine.
           */
-        virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine(lua_State* lua_state)
-        {
-            (void) lua_state;
-            return create_lua_coroutine();
-        }
-
         virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine()
         {
             return {};

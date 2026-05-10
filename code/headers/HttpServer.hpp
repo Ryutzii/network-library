@@ -28,7 +28,6 @@
 #include <algorithm>
 #include <tuple>
 
-struct lua_State;
 
 namespace argb
 {
@@ -39,6 +38,7 @@ namespace argb
         std::vector<std::thread> workers;
         std::queue<std::function<void()>> tasks;
         std::mutex tasks_mutex;
+        std::mutex exclusive_tasks_mutex;
         std::condition_variable tasks_cv;
         std::atomic<bool> stop_flag{ false };
 
@@ -102,29 +102,24 @@ namespace argb
             tasks_cv.notify_one();
             return res;
         }
+
+        template<typename F, typename... Args>
+        auto submit_exclusive(F&& f, Args&&... args)
+        {
+            return submit
+            (
+                [this, function = std::forward<F>(f),
+                 arguments = std::make_tuple(std::forward<Args>(args)...)]() mutable
+                {
+                    std::lock_guard<std::mutex> exclusive_lock(exclusive_tasks_mutex);
+                    return std::apply(std::move(function), std::move(arguments));
+                }
+            );
+        }
     };
 
     class HttpServer
     {
-
-        class LuaVirtualMachine
-        {
-        public:
-
-            LuaVirtualMachine();
-            ~LuaVirtualMachine();
-
-            LuaVirtualMachine(const LuaVirtualMachine&) = delete;
-            LuaVirtualMachine& operator = (const LuaVirtualMachine&) = delete;
-
-            bool is_available() const noexcept;
-            lua_State* get_state() const noexcept;
-
-        private:
-
-            struct Implementation;
-            std::unique_ptr<Implementation> implementation;
-        };
 
         struct ConnectionContext
         {
@@ -238,18 +233,14 @@ namespace argb
         std::map<TcpSocket::Handle, std::function<bool(HttpRequest&, HttpResponse&)>> lua_coroutines;
         std::mutex lua_coroutines_mutex;
 
-        // ThreadPool para handlers HTTP nativos C++.
+        // ThreadPool único para manejadores HTTP nativos y tareas asíncronas de Lua.
+        // Cuando una tarea necesite exclusividad puede usar submit_exclusive().
         ThreadPool thread_pool;
-
-        // ThreadPool separado para tareas asíncronas de Lua: sus workers no tocan la VM,
-        // solo programan/reprograman trabajo que el lua_thread reanuda de forma serializada.
-        ThreadPool lua_async_thread_pool;
 
     public:
 
         HttpServer()
             : thread_pool(std::max<size_t>(1, std::thread::hardware_concurrency()))
-            , lua_async_thread_pool(std::max<size_t>(1, std::thread::hardware_concurrency()))
         {
         }
 

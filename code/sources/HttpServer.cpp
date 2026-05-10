@@ -2,6 +2,7 @@
 /// angel.rodriguez@udit.es
 
 #include <HttpServer.hpp>
+#include <LuaRequestHandler.hpp>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -9,78 +10,11 @@
 #include <condition_variable>
 #include <deque>
 
-#if defined(__has_include)
-#   if __has_include(<lua.hpp>)
-#       include <lua.hpp>
-#       define ARGB_NETWORK_LIBRARY_HAS_LUA 1
-#   elif __has_include(<lua.h>) && __has_include(<lauxlib.h>) && __has_include(<lualib.h>)
-extern "C"
-{
-#       include <lua.h>
-#       include <lauxlib.h>
-#       include <lualib.h>
-}
-#       define ARGB_NETWORK_LIBRARY_HAS_LUA 1
-#   else
-#       define ARGB_NETWORK_LIBRARY_HAS_LUA 0
-#   endif
-#else
-#   define ARGB_NETWORK_LIBRARY_HAS_LUA 0
-#endif
-
 using std::cout;
 using std::endl;
 
 namespace argb
 {
-
-    struct HttpServer::LuaVirtualMachine::Implementation
-    {
-#if ARGB_NETWORK_LIBRARY_HAS_LUA
-        lua_State* state = nullptr;
-#endif
-    };
-
-    HttpServer::LuaVirtualMachine::LuaVirtualMachine()
-        : implementation(std::make_unique<Implementation>())
-    {
-#if ARGB_NETWORK_LIBRARY_HAS_LUA
-        implementation->state = luaL_newstate();
-        if (implementation->state != nullptr)
-        {
-            luaL_openlibs(implementation->state);
-        }
-#endif
-    }
-
-    HttpServer::LuaVirtualMachine::~LuaVirtualMachine()
-    {
-#if ARGB_NETWORK_LIBRARY_HAS_LUA
-        if (implementation && implementation->state != nullptr)
-        {
-            lua_close(implementation->state);
-            implementation->state = nullptr;
-        }
-#endif
-    }
-
-    bool HttpServer::LuaVirtualMachine::is_available() const noexcept
-    {
-#if ARGB_NETWORK_LIBRARY_HAS_LUA
-        return implementation && implementation->state != nullptr;
-#else
-        return false;
-#endif
-    }
-
-    lua_State* HttpServer::LuaVirtualMachine::get_state() const noexcept
-    {
-#if ARGB_NETWORK_LIBRARY_HAS_LUA
-        return implementation ? implementation->state : nullptr;
-#else
-        return nullptr;
-#endif
-    }
 
     // Constructores / movimiento
     HttpServer::ConnectionContext::ConnectionContext()
@@ -603,7 +537,7 @@ namespace argb
     {
         try
         {
-            lua_async_thread_pool.submit([this, handle]
+            thread_pool.submit([this, handle]
                 {
                     if (!running) return;
 
@@ -628,9 +562,9 @@ namespace argb
     {
         using namespace std::chrono_literals;
 
-        LuaVirtualMachine lua_vm;
+        LuaRequestHandler::StateScope lua_state_scope;
 
-        if (!lua_vm.is_available())
+        if (!LuaRequestHandler::is_lua_available())
         {
             cout << "Lua VM is not available: Lua headers/runtime were not found when building this library." << endl;
         }
@@ -658,7 +592,7 @@ namespace argb
 
             for (auto handle : batch)
             {
-                if (!lua_vm.is_available())
+                if (!LuaRequestHandler::is_lua_available())
                 {
                     std::lock_guard<std::mutex> conn_lock(connections_mutex);
                     auto it = connections.find(handle);
@@ -706,7 +640,7 @@ namespace argb
 
                             if (coroutine_it == lua_coroutines.end())
                             {
-                                auto created_coroutine = handler_raw->create_lua_coroutine(lua_vm.get_state());
+                                auto created_coroutine = handler_raw->create_lua_coroutine();
 
                                 // Compatibilidad: si un handler Lua antiguo aún no implementa corrutinas,
                                 // se adapta process() como una corrutina de un único paso.
@@ -756,7 +690,7 @@ namespace argb
                     }
                     else
                     {
-                        // La corrutina hizo yield: el pool Lua ejecuta la tarea asíncrona de
+                        // La corrutina hizo yield: el thread pool único ejecuta la tarea asíncrona de
                         // reprogramación y el hilo Lua la reanuda más adelante de forma segura.
                         it->second.last_activity = now();
                         schedule_lua_resume(handle);
