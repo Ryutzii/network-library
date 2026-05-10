@@ -11,21 +11,9 @@
 
 namespace argb
 {
-
-    /** This class serves as an interface for handling HTTP requests. It defines a pure virtual method `process` that
-      * must be implemented by derived classes to provide custom logic for processing incoming HTTP requests and generating
-      * appropriate HTTP responses.
-      */
     class HttpRequestHandler
     {
     public:
-
-        /** This class serves as a smart pointer wrapper for HttpRequestHandler objects, allowing the HttpServer to
-          * manage both raw pointers and unique_ptr instances seamlessly. It provides a uniform interface for accessing
-          * the underlying HttpRequestHandler, regardless of how it was created or passed to the server.
-          * This design simplifies memory management and ensures that the server can handle request handlers without
-          * worrying about ownership semantics.
-          */
         class Ptr
         {
 
@@ -112,23 +100,8 @@ namespace argb
     public:
 
         virtual ~HttpRequestHandler() = default;
-
-        /** Handles an incoming HTTP request and produces an appropriate response. This method must be implemented by
-          * derived classes to provide custom request handling logic for processing incoming HTTP requests and generating
-          * appropriate HTTP responses.
-          */
         virtual bool process (const HttpRequest & request, HttpResponse & response) = 0;
-
-        /** Indica si este handler necesita ejecutarse en el hilo único de Lua.
-          * Por defecto devuelve false; LuaRequestHandler lo sobreescribe para devolver true.
-          */
         virtual bool requires_lua() const { return false; }
-
-        /** Crear una "corrutina" ejecutable en el hilo Lua.
-          * Debe devolverse una std::function que:
-          *  - al invocarse reanuda la corrutina y devuelve true si ha terminado;
-          *  - devuelve false si la corrutina se ha yield/pausado y debe reprogramarse.
-          */
         virtual std::function<bool(HttpRequest&, HttpResponse&)> create_lua_coroutine()
         {
             return {};

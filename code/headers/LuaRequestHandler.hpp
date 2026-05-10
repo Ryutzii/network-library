@@ -10,13 +10,7 @@ struct lua_State;
 namespace argb
 {
 
-    /** Base class for HTTP handlers implemented on top of the shared Lua virtual machine.
-      *
-      * HttpServer owns the scheduling thread, but the single Lua state itself is managed here. Derived handlers can
-      * override create_lua_coroutine(lua_State*) and create a real Lua coroutine with that state (for example with
-      * lua_newthread/lua_resume). The returned function is resumed cooperatively by HttpServer: false means yielded,
-      * true means finished.
-      */
+    // Base para handlers Lua; gestiona una VM compartida y corrutinas cooperativas.
     class LuaRequestHandler : public HttpRequestHandler
     {
     public:
